@@ -10,7 +10,7 @@ This repository contains the official implementation for **TriTAC**, a novel hyp
 
 ## Dataset
 
-We use the [HySpecNet-11k](https://www.rsim.tu-berlin.de/menue/research/datasets/hyspecnet_11k/) dataset, a large-scale hyperspectral dataset.
+We use the [HySpecNet-11k](https://hyspecnet.rsim.berlin/) dataset, a large-scale hyperspectral dataset.
 
 ## Training
 
