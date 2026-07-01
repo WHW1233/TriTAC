@@ -14,7 +14,10 @@ We use the [HySpecNet-11k](https://hyspecnet.rsim.berlin/) dataset, a large-scal
 
 ## Training
 
-To train the TriTAC framework on CPU/GPU, use the integrated `train_dcae_hsi_task.py` script:
+Training the TriTAC framework consists of two main stages: first pre-training the main compression network, and then training the task adapters.
+
+### Stage 1: Main Compression Network Training
+In this stage, you optimize the network solely for compression capabilities (Bpp, MSE, and SAM). You can temporarily disable the task adapter losses by setting `--lambda_m 0`.
 
 ```bash
 python train_dcae_hsi_task.py \
@@ -24,6 +27,22 @@ python train_dcae_hsi_task.py \
     --eval_freq 1 \
     --batch-size 8 \
     --epochs 50 \
+    --lambda_m 0.0 \
+    --task_type classification
+```
+
+### Stage 2: Task-aware Adapter Training
+After the main network converges to a satisfactory reconstruction quality, unfreeze and optimize the downstream task adapters using joint losses.
+
+```bash
+python train_dcae_hsi_task.py \
+    -d /path/to/hyspecnet11k \
+    --test_dataset /path/to/hyspecnet11k/test_data \
+    --in_channels 202 \
+    --eval_freq 1 \
+    --batch-size 8 \
+    --epochs 50 \
+    --lambda_m 10.0 \
     --task_type classification
 ```
 
@@ -31,7 +50,7 @@ python train_dcae_hsi_task.py \
 - `--in_channels`: Number of spectral bands in the hyperspectral imagery (e.g., 202).
 - `--task_type`: Downstream task to optimize (e.g., `classification` or `segmentation`).
 - `--lambda`: Bit-rate distortion parameter for controlling the compression ratio.
-- `--lambda_m`: Task loss weight for joint optimization.
+- `--lambda_m`: Task loss weight for joint optimization (set to 0 during Stage 1).
 - `--alpha`: Trade-off weight between SAM and MSE in human-vision distortion metric.
 
 ## Evaluation Metrics
