@@ -107,10 +107,11 @@ def spectral_angle_mapper_loss(x, y, eps=1e-8):
 # ==========================================
 
 class Hyspecnet11kDataset(Dataset):
-    def __init__(self, root, transform=None, is_train=True):
+    def __init__(self, root, transform=None, is_train=True, num_bands=200):
         self.root = Path(root)
         self.transform = transform
         self.is_train = is_train
+        self.num_bands = num_bands
         
         # Depending on whether data is flat or in 'data' directory
         data_dir = self.root / 'data' if (self.root / 'data').exists() else self.root
@@ -132,6 +133,10 @@ class Hyspecnet11kDataset(Dataset):
     def __getitem__(self, index):
         impath = self.image_paths[index]
         img = np.load(impath).astype(np.float32) # (C, H, W)
+        
+        # Only use the first num_bands channels
+        if self.num_bands and img.shape[0] > self.num_bands:
+            img = img[:self.num_bands, :, :]
         
         img = img / (img.max() + 1e-8)  # normalize
         img = torch.from_numpy(img)
@@ -293,7 +298,7 @@ def main(argv):
     parser.add_argument("--alpha", type=float, default=0.1, help="SAM vs MSE weight")
     parser.add_argument("--clip_max_norm", default=1.0, type=float)
     parser.add_argument("--save_path", type=str, default="./hsi_runs/")
-    parser.add_argument("--in_channels", type=int, default=202)
+    parser.add_argument("--in_channels", type=int, default=200)
     parser.add_argument("--task_type", type=str, default="classification", choices=["classification", "segmentation"])
     parser.add_argument("--eval_freq", type=int, default=1, help="Evaluate every N epochs")
     parser.add_argument("--checkpoint", type=str, default="", help="Path to pre-trained Stage 1 checkpoint")
