@@ -171,20 +171,45 @@ def main(argv):
     
     net = DCAE(in_channels=args.in_channels).to(device)
     optimizer, aux_optimizer = configure_optimizers(net, args)
-    
+
     lr_scheduler = optim.lr_scheduler.MultiStepLR(optimizer, [40], gamma=0.1, last_epoch=-1)
     os.makedirs(args.save_path, exist_ok=True)
-    
+
     print(f"Starting Main Network Training on {device} with in_channels={args.in_channels}")
-    
+    print(f"Batch size: {args.batch_size}, Epochs: {args.epochs}")
+    print(f"Train samples: {len(train_dataset)}, Test samples: {len(test_dataset)}")
+
+    best_loss = float("inf")
     for epoch in range(args.epochs):
         train_one_epoch(net, train_dataloader, optimizer, aux_optimizer, epoch, args, lr_scheduler)
         lr_scheduler.step()
-        
+
+        test_loss = float("inf")
         if (epoch + 1) % args.eval_freq == 0:
-            test_epoch(net, test_dataloader, epoch, args)
-        
-        torch.save({"epoch": epoch, "state_dict": net.state_dict()}, os.path.join(args.save_path, "hsi_checkpoint.pth.tar"))
+            test_loss = test_epoch(net, test_dataloader, epoch, args)
+
+        # Save latest checkpoint
+        torch.save({
+            "epoch": epoch,
+            "state_dict": net.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "aux_optimizer": aux_optimizer.state_dict(),
+            "lr_scheduler": lr_scheduler.state_dict(),
+            "loss": test_loss,
+        }, os.path.join(args.save_path, "checkpoint_last.pth.tar"))
+
+        # Save best checkpoint
+        if test_loss < best_loss:
+            best_loss = test_loss
+            torch.save({
+                "epoch": epoch,
+                "state_dict": net.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "aux_optimizer": aux_optimizer.state_dict(),
+                "lr_scheduler": lr_scheduler.state_dict(),
+                "loss": test_loss,
+            }, os.path.join(args.save_path, "checkpoint_best.pth.tar"))
+            print(f"  >>> New best model saved (loss={best_loss:.4f})")
 
 if __name__ == "__main__":
     main(sys.argv[1:])
