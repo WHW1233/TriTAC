@@ -584,6 +584,7 @@ class SSFMA(nn.Module):
     """
     Spectral-Spatial-Frequency Modulation Adapter (SSFMA):
     Sequentially links SpMA, SMA, and FMA to progressively refine latent representations.
+    Uses a residual connection to ensure stable gradient flow.
     """
     def __init__(self, channels, reduction=16):
         super().__init__()
@@ -592,10 +593,11 @@ class SSFMA(nn.Module):
         self.fma = FMA(channels)
 
     def forward(self, x):
+        residual = x
         x = self.spma(x)
         x = self.sma(x)
         x = self.fma(x)
-        return x
+        return x + residual
 
 class DCAE(CompressionModel):
     def __init__(self, head_dim=[8, 16, 32, 32, 16, 8], drop_path_rate=0, N=192,  M=320, num_slices=5, max_support_slices=5, in_channels=3, **kwargs):
@@ -649,7 +651,6 @@ class DCAE(CompressionModel):
             *self.m_down2,
             SSFMA(feature_dim[2]),
             *self.m_down3,
-            SSFMA(M)
         )
         
 
@@ -661,7 +662,6 @@ class DCAE(CompressionModel):
             *self.m_up2,
             SSFMA(feature_dim[0]),
             *self.m_up3,
-            SSFMA(output_image_channel)
         )
 
         self.ha_down = [SwinBlockWithConvMulti(N, N, 32, 4, 0, ResScaleConvolutionGateBlock, block_num=1)] + \

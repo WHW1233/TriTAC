@@ -153,7 +153,7 @@ def main(argv):
     parser.add_argument("--aux-learning-rate", default=1e-3, type=float)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--test-batch-size", type=int, default=2)
-    parser.add_argument("--lambda", dest="lmbda", type=float, default=100.0, help="Bit-rate distortion parameter")
+    parser.add_argument("--lambda", dest="lmbda", type=float, default=8.0, help="Bit-rate distortion parameter")
     parser.add_argument("--alpha", type=float, default=0.1, help="SAM vs MSE weight")
     parser.add_argument("--clip_max_norm", default=1.0, type=float)
     parser.add_argument("--save_path", type=str, default="./hsi_runs/")
