@@ -17,27 +17,26 @@ We use the [HySpecNet-11k](https://hyspecnet.rsim.berlin/) dataset, a large-scal
 Training the TriTAC framework consists of two main stages: first pre-training the main compression network, and then training the task adapters.
 
 ### Stage 1: Main Compression Network Training
-In this stage, you optimize the network solely for compression capabilities (Bpp, MSE, and SAM). You can temporarily disable the task adapter losses by setting `--lambda_m 0`.
+In this stage, you optimize the main TriTAC network solely for compression capabilities (Bpp, MSE, and SAM) using the `train.py` script.
 
 ```bash
-python train_dcae_hsi_task.py \
+python train.py \
     -d /path/to/hyspecnet11k \
     --test_dataset /path/to/hyspecnet11k/test_data \
     --in_channels 202 \
     --eval_freq 1 \
     --batch-size 8 \
-    --epochs 50 \
-    --lambda_m 0.0 \
-    --task_type classification
+    --epochs 50
 ```
 
 ### Stage 2: Task-aware Adapter Training
-After the main network converges to a satisfactory reconstruction quality, unfreeze and optimize the downstream task adapters using joint losses.
+After the main network converges to a satisfactory reconstruction quality, load the checkpoint and optimize the downstream task adapters using joint losses with the `train_dcae_hsi_task.py` script.
 
 ```bash
 python train_dcae_hsi_task.py \
     -d /path/to/hyspecnet11k \
     --test_dataset /path/to/hyspecnet11k/test_data \
+    --checkpoint ./hsi_runs/hsi_checkpoint.pth.tar \
     --in_channels 202 \
     --eval_freq 1 \
     --batch-size 8 \

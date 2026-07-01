@@ -296,6 +296,7 @@ def main(argv):
     parser.add_argument("--in_channels", type=int, default=202)
     parser.add_argument("--task_type", type=str, default="classification", choices=["classification", "segmentation"])
     parser.add_argument("--eval_freq", type=int, default=1, help="Evaluate every N epochs")
+    parser.add_argument("--checkpoint", type=str, default="", help="Path to pre-trained Stage 1 checkpoint")
     args = parser.parse_args(argv)
     
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -309,6 +310,11 @@ def main(argv):
     
     # Model
     net = DCAE(in_channels=args.in_channels).to(device)
+    if args.checkpoint and os.path.exists(args.checkpoint):
+        print(f"Loading pre-trained Stage 1 checkpoint from {args.checkpoint}")
+        checkpoint = torch.load(args.checkpoint, map_location=device)
+        net.load_state_dict(checkpoint["state_dict"])
+        
     optimizer, aux_optimizer = configure_optimizers(net, args)
     
     # Task Model

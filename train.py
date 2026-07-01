@@ -1,510 +1,190 @@
 import os
-os.environ['TMPDIR'] = '/tmp'
 import argparse
 import math
 import random
 import sys
 import time
-import csv
-from PIL import Image
+from pathlib import Path
+import numpy as np
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset
 
-from torch.utils.data import DataLoader
-from torch import distributed as dist
-from torch.utils.data.distributed import DistributedSampler
-from torchvision import transforms
+from models import DCAE
 
-from compressai.datasets import ImageFolder
-from compressai.zoo import models
-from pytorch_msssim import ms_ssim
-
-from models import (
-    DCAE
-
-)
-from torch.utils.tensorboard import SummaryWriter   
-import os
 torch.set_num_threads(8)
 torch.backends.cudnn.deterministic=True
 torch.backends.cudnn.benchmark=False
 
-def test_compute_psnr(a, b):
-    b = b.to(a.device)
-    mse = torch.mean((a - b)**2).item()
-    return -10 * math.log10(mse)
+def spectral_angle_mapper_loss(x, y, eps=1e-8):
+    dot = torch.sum(x * y, dim=1)
+    norm_x = torch.norm(x, p=2, dim=1)
+    norm_y = torch.norm(y, p=2, dim=1)
+    cos_theta = dot / (norm_x * norm_y + eps)
+    cos_theta = torch.clamp(cos_theta, -1.0 + eps, 1.0 - eps)
+    sam = torch.acos(cos_theta)
+    return sam.mean()
 
-def test_compute_msssim(a, b):
-    b = b.to(a.device)
-    return -10 * math.log10(1-ms_ssim(a, b, data_range=1.).item())
-
-def test_compute_bpp(out_net):
-    size = out_net['x_hat'].size()
-    num_pixels = size[0] * size[2] * size[3]
-    bpp_dict = {}
-    ans = 0
-    for likelihoods in out_net['likelihoods']:
-        fsize = out_net['likelihoods'][likelihoods].size()
-        num = 1
-        for s in fsize:
-            num = num * s
+class Hyspecnet11kDataset(Dataset):
+    def __init__(self, root, transform=None, is_train=True):
+        self.root = Path(root)
+        self.transform = transform
+        self.is_train = is_train
         
-        print(fsize)
-        bpp_dict[likelihoods] = torch.log(out_net['likelihoods'][likelihoods]).sum() / (-math.log(2) * num_pixels)
-        print(f"{likelihoods}:{bpp_dict[likelihoods]}")
-        ans = ans + bpp_dict[likelihoods]
-    print(f"ans:{ans}")
-    return sum(torch.log(likelihoods).sum() / (-math.log(2) * num_pixels)
-              for likelihoods in out_net['likelihoods'].values()).item()
-
-
-def compute_msssim(a, b):
-    return ms_ssim(a, b, data_range=1.)
-
-
-class RateDistortionLoss(nn.Module):
-    """Custom rate distortion loss with a Lagrangian parameter."""
-
-    def __init__(self, lmbda=1e-2, type='mse'):
-        super().__init__()
-        self.mse = nn.MSELoss()
-        self.lmbda = lmbda
-        self.type = type
-
-    def forward(self, output, target):
-        N, _, H, W = target.size()
-        out = {}
-        num_pixels = N * H * W
-
-        out["bpp_loss"] = sum(
-            (torch.log(likelihoods).sum() / (-math.log(2) * num_pixels))
-            for likelihoods in output["likelihoods"].values()
-        )
-        if self.type == 'mse':
-            out["mse_loss"] = self.mse(output["x_hat"], target)
-            out["loss"] = self.lmbda * 255 ** 2 * out["mse_loss"] + out["bpp_loss"]
+        data_dir = self.root / 'data' if (self.root / 'data').exists() else self.root
+        self.image_paths = sorted(data_dir.rglob('*.npy'))
+        assert len(self.image_paths) > 0, f'Found {len(self.image_paths)} images in {root}.'
+        
+        split_idx = int(len(self.image_paths) * 0.9)
+        if self.is_train:
+            self.image_paths = self.image_paths[:split_idx]
         else:
-            out['ms_ssim_loss'] = compute_msssim(output["x_hat"], target)
-            out["loss"] = self.lmbda * (1 - out['ms_ssim_loss']) + out["bpp_loss"]
+            self.image_paths = self.image_paths[split_idx:]
 
-        return out
+    def __len__(self):
+        return len(self.image_paths)
 
-class AverageMeter:
-    """Compute running average."""
-
-    def __init__(self):
-        self.val = 0
-        self.avg = 0
-        self.sum = 0
-        self.count = 0
-
-    def update(self, val, n=1):
-        self.val = val
-        self.sum += val * n
-        self.count += n
-        self.avg = self.sum / self.count
-
-
-class CustomDataParallel(nn.DataParallel):
-    """Custom DataParallel to access the module methods."""
-
-    def __getattr__(self, key):
-        try:
-            return super().__getattr__(key)
-        except AttributeError:
-            return getattr(self.module, key)
+    def __getitem__(self, index):
+        impath = self.image_paths[index]
+        img = np.load(impath).astype(np.float32)
+        img = img / (img.max() + 1e-8)
+        img = torch.from_numpy(img)
+        return img, 0
 
 def configure_optimizers(net, args):
-    """Separate parameters for the main optimizer and the auxiliary optimizer.
-    Return two optimizers"""
-
-    parameters = {
-        n
-        for n, p in net.named_parameters()
-        if not n.endswith(".quantiles") and p.requires_grad
-    }
-    aux_parameters = {
-        n
-        for n, p in net.named_parameters()
-        if n.endswith(".quantiles") and p.requires_grad
-    }
-
-    # Make sure we don't have an intersection of parameters
+    parameters = {n for n, p in net.named_parameters() if not n.endswith(".quantiles") and p.requires_grad}
+    aux_parameters = {n for n, p in net.named_parameters() if n.endswith(".quantiles") and p.requires_grad}
     params_dict = dict(net.named_parameters())
-    inter_params = parameters & aux_parameters
-    union_params = parameters | aux_parameters
-
-    assert len(inter_params) == 0
-    assert len(union_params) - len(params_dict.keys()) == 0
-
-    optimizer = optim.Adam(
-        (params_dict[n] for n in sorted(parameters)),
-        lr=args.learning_rate,
-    )
-    aux_optimizer = optim.Adam(
-        (params_dict[n] for n in sorted(aux_parameters)),
-        lr=args.aux_learning_rate,
-    )
+    optimizer = optim.Adam((params_dict[n] for n in sorted(parameters)), lr=args.learning_rate)
+    aux_optimizer = optim.Adam((params_dict[n] for n in sorted(aux_parameters)), lr=args.aux_learning_rate)
     return optimizer, aux_optimizer
 
-
-def train_one_epoch(
-    model, criterion, train_dataloader, optimizer, aux_optimizer, epoch, clip_max_norm, train_sampler, type='mse', args=None, lr_scheduler=None
-):
+def train_one_epoch(model, train_dataloader, optimizer, aux_optimizer, epoch, args, lr_scheduler):
     model.train()
     device = next(model.parameters()).device
+    alpha = args.alpha
 
-    if torch.cuda.device_count() > 1:
-        train_sampler.set_epoch(epoch)
-
-    pre_time = 0
-    now_time = time.time()
-    for i, d in enumerate(train_dataloader):
-
+    for i, (d, _) in enumerate(train_dataloader):
         d = d.to(device)
+        B, C, H, W = d.shape
+        num_pixels = B * H * W
+        
         optimizer.zero_grad()
         aux_optimizer.zero_grad()
+        
         out_net = model(d)
-        out_criterion = criterion(out_net, d)
-        out_criterion["loss"].backward()
+        
+        bpp_loss = sum(
+            (torch.log(likelihoods).sum() / (-math.log(2) * num_pixels))
+            for likelihoods in out_net["likelihoods"].values()
+        )
+        bpppb_loss = bpp_loss / C
+        
+        x_hat = out_net["x_hat"]
+        mse_loss = nn.MSELoss()(x_hat, d)
+        sam_loss = spectral_angle_mapper_loss(x_hat, d)
+        
+        d_human = (1 - alpha) * mse_loss + alpha * sam_loss
+        loss = args.lmbda * d_human + bpp_loss
+        
+        loss.backward()
 
-        if clip_max_norm > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), clip_max_norm) 
+        if args.clip_max_norm > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_max_norm) 
+        
         optimizer.step()
         
         aux_loss = model.module.aux_loss() if torch.cuda.device_count() > 1 else model.aux_loss()
         aux_loss.backward()
         aux_optimizer.step()
-        
 
-        if (i+1) % 100 == 0:
-            pre_time = now_time
-            now_time = time.time()
-            print(f'time : {now_time-pre_time}\n', end='')
-            print(f'lr : {lr_scheduler.get_last_lr()[0]}\n', end='')
-            
-            if type == 'mse':
-                print(
-                    f"Train epoch {epoch}: ["
-                    f"{(i+1)*len(d)}/{len(train_dataloader.dataset)}]"
-                    f'\tLoss: {out_criterion["loss"].item():.3f} |'
-                    f'\tMSE loss: {out_criterion["mse_loss"].item():.3f} |'
-                    f'\tBpp loss: {out_criterion["bpp_loss"].item():.2f} |'
-                    f"\tAux loss: {aux_loss.item():.2f}"
-                )
-            else:
-                print(
-                    f"Train epoch {epoch}: ["
-                    f"{(i+1)*len(d)}/{len(train_dataloader.dataset)}"
-                    f'\tLoss: {out_criterion["loss"].item():.3f} |'
-                    f'\tMS_SSIM loss: {out_criterion["ms_ssim_loss"].item():.3f} |'
-                    f'\tBpp loss: {out_criterion["bpp_loss"].item():.2f} |'
-                    f"\tAux loss: {aux_loss.item():.2f}"
-                )
+        if (i+1) % 10 == 0:
+            print(f"Train epoch {epoch}: [{i*len(d)}/{len(train_dataloader.dataset)}]\tLoss: {loss.item():.4f} | Bpppb: {bpppb_loss.item():.4f} | MSE: {mse_loss.item():.4f} | SAM: {sam_loss.item():.4f}")
 
-
-def test_epoch(epoch, test_dataloader, model, criterion, type='mse', args=None):
+def test_epoch(model, test_dataloader, epoch, args):
     model.eval()
     device = next(model.parameters()).device
-    if type == 'mse':
-        loss = AverageMeter()
-        bpp_loss = AverageMeter()
-        mse_loss = AverageMeter()
-        aux_loss = AverageMeter()
+    alpha = args.alpha
 
-        with torch.no_grad():
-            for d in test_dataloader:
-                d = d.to(device)
-                out_net = model(d)
-                out_criterion = criterion(out_net, d)
-                loss.update(out_criterion["loss"])
-                aux_loss.update(model.module.aux_loss() if torch.cuda.device_count() > 1 else model.aux_loss())
-                mse_loss.update(out_criterion["mse_loss"])
-                bpp_loss.update(out_criterion["bpp_loss"])
-
-        print(
-            f"Test epoch {epoch}: Average losses:"
-            f"\tLoss: {loss.avg:.3f} |"
-            f"\tMSE loss: {mse_loss.avg:.3f} |"
-            f"\tBpp loss: {bpp_loss.avg:.2f} |"
-            f"\tAux loss: {aux_loss.avg:.2f}\n"
-        )
-
-    else:
-        loss = AverageMeter()
-        bpp_loss = AverageMeter()
-        ms_ssim_loss = AverageMeter()
-        aux_loss = AverageMeter()
-
-        with torch.no_grad():
-            for d in test_dataloader:
-                d = d.to(device)
-                out_net = model(d)
-                out_criterion = criterion(out_net, d)
-                aux_loss.update(model.module.aux_loss() if torch.cuda.device_count() > 1 else model.aux_loss())
-                bpp_loss.update(out_criterion["bpp_loss"])
-                loss.update(out_criterion["loss"])
-                ms_ssim_loss.update(out_criterion["ms_ssim_loss"])
-
-        print(
-            f"Test epoch {epoch}: Average losses:"
-            f"\tLoss: {loss.avg:.3f} |"
-            f"\tMS_SSIM loss: {ms_ssim_loss.avg:.3f} |"
-            f"\tBpp loss: {bpp_loss.avg:.2f} |"
-            f"\tAux loss: {aux_loss.avg:.2f}\n"
-        )
-
-    return loss.avg
-
-def pad(x, p):
-    h, w = x.size(2), x.size(3)
-    new_h = (h + p - 1) // p * p
-    new_w = (w + p - 1) // p * p
-    padding_left = (new_w - w) // 2
-    padding_right = new_w - w - padding_left
-    padding_top = (new_h - h) // 2
-    padding_bottom = new_h - h - padding_top
-    x_padded = F.pad(
-        x,
-        (padding_left, padding_right, padding_top, padding_bottom),
-        mode="constant",
-        value=0,
-    )
-    return x_padded, (padding_left, padding_right, padding_top, padding_bottom)
-
-def crop(x, padding):
-    return F.pad(
-        x,
-        (-padding[0], -padding[1], -padding[2], -padding[3]),
-    )
-
-def save_checkpoint(state, is_best, epoch, save_path, filename):
-    torch.save(state, save_path + "checkpoint_latest.pth.tar")
-    if epoch % 5 == 0:
-        torch.save(state, filename)
-    if is_best:
-        torch.save(state, save_path + "checkpoint_best.pth.tar")
-
-
-def parse_args(argv):
-    parser = argparse.ArgumentParser(description="Example training script.")
-
-    parser.add_argument("--local-rank", default=os.getenv('LOCAL_RANK', -1), type=int)
-    parser.add_argument(
-        "-d", "--dataset", type=str, required=True, help="Training dataset"
-    )
-    parser.add_argument(
-        "-e",
-        "--epochs",
-        default=50,
-        type=int,
-        help="Number of epochs (default: %(default)s)",
-    )
-    parser.add_argument(
-        "-lr",
-        "--learning-rate",
-        default=1e-4,
-        type=float,
-        help="Learning rate (default: %(default)s)",
-    )
-    parser.add_argument(
-        "-n",
-        "--num-workers",
-        type=int,
-        default=20,
-        help="Dataloaders threads (default: %(default)s)",
-    )
-    parser.add_argument(
-        "--lambda",
-        dest="lmbda",
-        type=float,
-        default=3,
-        help="Bit-rate distortion parameter (default: %(default)s)",
-    )
-    parser.add_argument(
-        "--batch-size", type=int, default=8, help="Batch size (default: %(default)s)"
-    )
-    parser.add_argument(
-        "--test-batch-size",
-        type=int,
-        default=8,
-        help="Test batch size (default: %(default)s)",
-    )
-    parser.add_argument(
-        "--aux-learning-rate",
-        default=1e-3,
-        help="Auxiliary loss learning rate (default: %(default)s)",
-    )
-    parser.add_argument(
-        "--patch-size",
-        type=int,
-        nargs=2,
-        default=(256, 256),
-        help="Size of the patches to be cropped (default: %(default)s)",
-    )
-    parser.add_argument("--cuda", action="store_true", help="Use cuda")
-    parser.add_argument(
-        "--save", action="store_true", default=True, help="Save model to disk"
-    )
-    parser.add_argument(
-        "--drop", action="store_true", default=False,
-    )
-    parser.add_argument(
-        "--seed", type=float, default=100, help="Set random seed for reproducibility"
-    )
-    parser.add_argument(
-        "--clip_max_norm",
-        default=1.0,
-        type=float,
-        help="gradient clipping max norm (default: %(default)s",
-    )
-    parser.add_argument("--checkpoint", type=str, help="Path to a checkpoint")
-    parser.add_argument("--type", type=str, default='mse', help="loss type", choices=['mse', "ms-ssim", "l1"])
-    parser.add_argument("--save_path", type=str, help="save_path")
-    parser.add_argument(
-        "--N", type=int, default=128,
-    )
-    parser.add_argument(
-        "--M", type=int, default=320,
-    )
-    parser.add_argument(
-        "--lr_epoch", nargs='+', type=int
-    )
-    parser.add_argument(
-        "--continue_train", action="store_true", default=True
-    )
-    args = parser.parse_args(argv)
-    return args
-
+    loss_sum = bpppb_sum = mse_sum = sam_sum = psnr_sum = 0
+    count = 0
+    
+    with torch.no_grad():
+        for d, _ in test_dataloader:
+            d = d.to(device)
+            B, C, H, W = d.shape
+            num_pixels = B * H * W
+            
+            out_net = model(d)
+            
+            bpp_loss = sum(
+                (torch.log(likelihoods).sum() / (-math.log(2) * num_pixels))
+                for likelihoods in out_net["likelihoods"].values()
+            )
+            bpppb_loss = bpp_loss / C
+            
+            x_hat = out_net["x_hat"]
+            mse_loss = nn.MSELoss()(x_hat, d)
+            sam_loss = spectral_angle_mapper_loss(x_hat, d)
+            psnr = 10 * math.log10(1.0 / (mse_loss.item() + 1e-8))
+            
+            d_human = (1 - alpha) * mse_loss + alpha * sam_loss
+            loss = args.lmbda * d_human + bpp_loss
+            
+            loss_sum += loss.item()
+            bpppb_sum += bpppb_loss.item()
+            mse_sum += mse_loss.item()
+            sam_sum += sam_loss.item()
+            psnr_sum += psnr
+            count += 1
+            
+    print(f"Test epoch {epoch}: Loss: {loss_sum/count:.4f} | Bpppb: {bpppb_sum/count:.4f} | MSE: {mse_sum/count:.4f} | SAM: {sam_sum/count:.4f} | PSNR: {psnr_sum/count:.4f}")
+    return loss_sum/count
 
 def main(argv):
-    # torch.autograd.set_detect_anomaly(True)
-
-    args = parse_args(argv)
-    for arg in vars(args):
-        print(arg, ":", getattr(args, arg))
-    type = args.type
-    save_path = os.path.join(args.save_path, str(args.lmbda))
-    if not os.path.exists(save_path):
-        os.makedirs(save_path)
-        os.makedirs(save_path + "tensorboard/")
-
-    if args.seed is not None:
-        torch.manual_seed(args.seed)
-        random.seed(args.seed)
-        
-    writer = SummaryWriter(save_path + "tensorboard/")
-
-    train_transforms = transforms.Compose(
-        [transforms.RandomCrop(args.patch_size), transforms.ToTensor()]
-    )
-    test_transforms = transforms.Compose(
-        [transforms.CenterCrop(args.patch_size), transforms.ToTensor()]
-    )
-
-    train_dataset = ImageFolder(args.dataset, split="train", transform=train_transforms)
-    test_dataset = ImageFolder(args.dataset, split="test", transform=test_transforms)
-
-    if args.local_rank != -1:
-        torch.cuda.set_device(args.local_rank)
-        device = torch.device("cuda", args.local_rank)
-        torch.distributed.init_process_group(backend="nccl", init_method='env://')
-    else: 
-        device = "cuda"
-        
-    net = DCAE()
-    net = net.to(device)
-
-    if args.cuda and torch.cuda.device_count() > 1:
-        net = nn.parallel.DistributedDataParallel(net, device_ids=[args.local_rank], output_device=args.local_rank, find_unused_parameters=True)
-        train_sampler = DistributedSampler(train_dataset)
-        test_sampler = DistributedSampler(test_dataset)
-        
-    train_dataloader = DataLoader(
-        train_dataset,
-        sampler=train_sampler if torch.cuda.device_count() > 1 else None,
-        shuffle=True if torch.cuda.device_count() == 1 else None,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        pin_memory=True,
-    )
-
-    test_dataloader = DataLoader(
-        test_dataset,
-        sampler=test_sampler if torch.cuda.device_count() > 1 else None,
-        batch_size=args.test_batch_size,
-        num_workers=args.num_workers,
-        shuffle=False,
-        pin_memory=True,
-    )
+    parser = argparse.ArgumentParser(description="TriTAC Main Compression Network Training")
+    parser.add_argument("-d", "--dataset", type=str, required=True, help="Training dataset")
+    parser.add_argument("--test_dataset", type=str, default="/media/nercms/EXTERNAL_USB/satellite_data/HSI_data/hyspecnet11k/test_data", help="Test dataset")
+    parser.add_argument("-e", "--epochs", default=50, type=int)
+    parser.add_argument("-lr", "--learning-rate", default=1e-4, type=float)
+    parser.add_argument("--aux-learning-rate", default=1e-3, type=float)
+    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--test-batch-size", type=int, default=2)
+    parser.add_argument("--lambda", dest="lmbda", type=float, default=100.0, help="Bit-rate distortion parameter")
+    parser.add_argument("--alpha", type=float, default=0.1, help="SAM vs MSE weight")
+    parser.add_argument("--clip_max_norm", default=1.0, type=float)
+    parser.add_argument("--save_path", type=str, default="./hsi_runs/")
+    parser.add_argument("--in_channels", type=int, default=202)
+    parser.add_argument("--eval_freq", type=int, default=1, help="Evaluate every N epochs")
+    args = parser.parse_args(argv)
     
-
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    train_dataset = Hyspecnet11kDataset(args.dataset, is_train=True)
+    train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4)
+    
+    test_dataset = Hyspecnet11kDataset(args.test_dataset, is_train=False)
+    test_dataloader = DataLoader(test_dataset, batch_size=args.test_batch_size, shuffle=False, num_workers=4)
+    
+    net = DCAE(in_channels=args.in_channels).to(device)
     optimizer, aux_optimizer = configure_optimizers(net, args)
-    milestones = args.lr_epoch
-    print("milestones: ", milestones)
-
-
-    lr_scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones, gamma=0.1, last_epoch=-1)
-
-    criterion = RateDistortionLoss(lmbda=args.lmbda, type=type).to(device)
-    last_epoch = 0
-    if args.checkpoint:  
-        print("Loading", args.checkpoint)
-        checkpoint = torch.load(args.checkpoint, map_location=device)
-        net.load_state_dict(checkpoint["state_dict"])
-
-        if args.continue_train:
-            last_epoch = checkpoint["epoch"] + 1
-            optimizer.load_state_dict(checkpoint["optimizer"])
-            aux_optimizer.load_state_dict(checkpoint["aux_optimizer"])
-            lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
-
-    best_loss = float("inf")
-    for epoch in range(last_epoch, args.epochs):
-        train_one_epoch(
-            net,
-            criterion,
-            train_dataloader,
-            optimizer,
-            aux_optimizer,
-            epoch,
-            args.clip_max_norm,
-            train_sampler if torch.cuda.device_count() > 1 else None,
-            type,
-            args,
-            lr_scheduler
-        )
-
-        loss = test_epoch(epoch, test_dataloader, net, criterion, type, args)
-        writer.add_scalar('test_loss', loss, epoch)
-
-
-        global_rank = dist.get_rank() if torch.cuda.device_count() > 1 else 0
+    
+    lr_scheduler = optim.lr_scheduler.MultiStepLR(optimizer, [40], gamma=0.1, last_epoch=-1)
+    os.makedirs(args.save_path, exist_ok=True)
+    
+    print(f"Starting Main Network Training on {device} with in_channels={args.in_channels}")
+    
+    for epoch in range(args.epochs):
+        train_one_epoch(net, train_dataloader, optimizer, aux_optimizer, epoch, args, lr_scheduler)
         lr_scheduler.step()
-
-        is_best = loss < best_loss
-        best_loss = min(loss, best_loss)
-
-        if args.save and global_rank == 0:
-                save_checkpoint(
-                    {
-                        "epoch": epoch,
-                        "state_dict": net.state_dict(),
-                        "loss": loss,
-                        "optimizer": optimizer.state_dict(),
-                        "aux_optimizer": aux_optimizer.state_dict(),
-                        "lr_scheduler": lr_scheduler.state_dict(),
-                    },
-                    is_best,
-                    epoch,
-                    save_path,
-                    save_path + str(epoch) + "_checkpoint.pth.tar",
-                )
-
-
+        
+        if (epoch + 1) % args.eval_freq == 0:
+            test_epoch(net, test_dataloader, epoch, args)
+        
+        torch.save({"epoch": epoch, "state_dict": net.state_dict()}, os.path.join(args.save_path, "hsi_checkpoint.pth.tar"))
 
 if __name__ == "__main__":
     main(sys.argv[1:])
