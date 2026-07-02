@@ -600,7 +600,7 @@ class SSFMA(nn.Module):
         return x + residual
 
 class DCAE(CompressionModel):
-    def __init__(self, head_dim=[8, 16, 32, 32, 16, 8], drop_path_rate=0, N=192,  M=320, num_slices=5, max_support_slices=5, in_channels=3, **kwargs):
+    def __init__(self, head_dim=[8, 16, 32, 32, 16, 8], drop_path_rate=0, N=384,  M=640, num_slices=5, max_support_slices=5, in_channels=3, **kwargs):
         super().__init__() 
         self.head_dim = head_dim
         self.window_size = 8
@@ -611,7 +611,7 @@ class DCAE(CompressionModel):
         begin = 0
         input_image_channel = in_channels
         output_image_channel = in_channels
-        feature_dim = [96, 144, 256]
+        feature_dim = [192, 288, 512]
         
         basic_block = [ResScaleConvolutionGateBlock, ResScaleConvolutionGateBlock, ResScaleConvolutionGateBlock]
         swin_block = [SwinBlockWithConvMulti, SwinBlockWithConvMulti, SwinBlockWithConvMulti]
@@ -665,7 +665,7 @@ class DCAE(CompressionModel):
         )
 
         self.ha_down = [SwinBlockWithConvMulti(N, N, 32, 4, 0, ResScaleConvolutionGateBlock, block_num=1)] + \
-                      [conv(N, 192, kernel_size=3, stride=2)] 
+                      [conv(N, N, kernel_size=3, stride=2)] 
 
         self.h_a = nn.Sequential(
             *[ResidualBottleneckBlockWithStride(M, N)] + \
@@ -676,7 +676,7 @@ class DCAE(CompressionModel):
                       [ResidualBottleneckBlockWithUpsample(N, M)]
 
         self.h_z_s1 = nn.Sequential(
-            *[deconv(192, N, kernel_size=3, stride=2)] + \
+            *[deconv(N, N, kernel_size=3, stride=2)] + \
             self.hs_up1
         )
 
@@ -684,40 +684,40 @@ class DCAE(CompressionModel):
                       [ResidualBottleneckBlockWithUpsample(N, M)]
 
         self.h_z_s2 = nn.Sequential(
-            *[deconv(192, N, kernel_size=3, stride=2)] + \
+            *[deconv(N, N, kernel_size=3, stride=2)] + \
             self.hs_up2
         )
 
         self.cc_mean_transforms = nn.ModuleList(
             nn.Sequential(
-                conv(320*2 + (320//self.num_slices)*min(i, 5) + prior_dim, 224, stride=1, kernel_size=3),
+                conv(M*2 + (M//self.num_slices)*min(i, 5) + prior_dim, 224, stride=1, kernel_size=3),
                 nn.GELU(),
                 conv(224, 128, stride=1, kernel_size=3),
                 nn.GELU(),
-                conv(128, (320//self.num_slices), stride=1, kernel_size=3),
+                conv(128, (M//self.num_slices), stride=1, kernel_size=3),
             ) for i in range(self.num_slices) 
         )
         self.cc_scale_transforms = nn.ModuleList(
             nn.Sequential(
-                conv(320*2 + (320//self.num_slices)*min(i, 5) + prior_dim, 224, stride=1, kernel_size=3),
+                conv(M*2 + (M//self.num_slices)*min(i, 5) + prior_dim, 224, stride=1, kernel_size=3),
                 nn.GELU(),
                 conv(224, 128, stride=1, kernel_size=3),
                 nn.GELU(),
-                conv(128, (320//self.num_slices), stride=1, kernel_size=3),
+                conv(128, (M//self.num_slices), stride=1, kernel_size=3),
             ) for i in range(self.num_slices)
             )
 
         self.lrp_transforms = nn.ModuleList(
             nn.Sequential(
-                conv(320*2 + (320//self.num_slices)*min(i+1, 6) + prior_dim, 224, stride=1, kernel_size=3),
+                conv(M*2 + (M//self.num_slices)*min(i+1, 6) + prior_dim, 224, stride=1, kernel_size=3),
                 nn.GELU(),
                 conv(224, 128, stride=1, kernel_size=3),
                 nn.GELU(),
-                conv(128, (320//self.num_slices), stride=1, kernel_size=3),
+                conv(128, (M//self.num_slices), stride=1, kernel_size=3),
             ) for i in range(self.num_slices)
         )
 
-        self.entropy_bottleneck = EntropyBottleneck(192)
+        self.entropy_bottleneck = EntropyBottleneck(N)
         self.gaussian_conditional = GaussianConditional(None)
 
     def update(self, scale_table=None, force=False):
