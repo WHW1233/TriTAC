@@ -1,6 +1,8 @@
-# TriTAC: Task-Aware Hyperspectral Image Compression
+# TriTAC: Task-Aware Hyperspectral Image Compression with Tri-Domain Latent Modulation
 
-This repository provides the core training, evaluation, and entropy coding workflows for **TriTAC: Task-Aware Hyperspectral Image Compression via Foundation Model Distillation and Hierarchical Latent Truncation**.
+> **Submission:** The manuscript entitled **“TriTAC: Task-Aware Hyperspectral Image Compression with Tri-Domain Latent Modulation”** was submitted to **IEEE Transactions on Geoscience and Remote Sensing (TGRS)** on **October 23, 2026**.
+
+This repository provides the core training, evaluation, and entropy coding workflows for TriTAC.
 
 The release supports HySpecNet-11k reconstruction and Indian Pines classification. The released configuration uses 100 input bands, a latent channel multiplier of 4, and spectral, spatial, and frequency TriLM branches at both the encoder and decoder. Training and deployment share the model implementation in `lvae/`; deployment entry points are in `deployment/`.
 
